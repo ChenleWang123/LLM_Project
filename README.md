@@ -27,6 +27,7 @@ Build an effective cultural question answering pipeline using LLM techniques suc
 To ensure fairness, only the following base model is allowed:
 
 > **Meta Llama 3 — 8B**
+> **Mistral-7B-Instruct-v0.2**
 
 Using other pre‑existing LLMs is not permitted.
 
