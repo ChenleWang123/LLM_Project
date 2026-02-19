@@ -184,7 +184,7 @@ zip submission.zip mcq_prediction.tsv saq_prediction.tsv
 
 ## 📊 评测结果展示
 
-![Evaluation Results](evaluation_results.png)
+![Evaluation Results](evaluation_results1.png)
 
 ---
 
