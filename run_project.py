@@ -1,27 +1,36 @@
-import os
 import pandas as pd
 import torch
-import ast
 import os
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import PeftModel
 from tqdm import tqdm
+import re  # Add this to the top of your script if not already there
 
-# ================= 配置区域 =================
-# 模型路径 (首次运行会自动下载)
+
+# Import our custom RAG retriever
+# Ensure rag/retriever.py is accessible from this script
+import sys
+
+sys.path.append(os.path.join(os.path.dirname(__file__), 'rag'))
+from rag.retriever import CulturalRetriever
+
+# ================= Configuration Area =================
 MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.2"
-# 文件路径 (确保这4个csv文件和脚本在同一目录)
+LORA_PATH = "model/mistral_lora_adapter"  # Path to your fine-tuned weights
+
 FILES = {
-    "train_mcq": "data/train_dataset_mcq.csv",
     "test_mcq": "data/test_dataset_mcq.csv",
-    "train_saq": "data/train_dataset_saq.csv",
     "test_saq": "data/test_dataset_saq.csv"
 }
-# ===========================================
+
+
+# ====================================================
 
 def setup_model():
-    print(f"Loading model: {MODEL_ID}...")
+    """Load the base model and apply the LoRA adapter."""
+    print(f"Loading base model: {MODEL_ID}...")
 
-    # 4-bit 量化配置 (为了在 HPC 省显存并提速)
+    # 4-bit quantization config to save VRAM
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -30,41 +39,49 @@ def setup_model():
     )
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-    model = AutoModelForCausalLM.from_pretrained(
+    tokenizer.pad_token = tokenizer.eos_token
+
+    base_model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         quantization_config=bnb_config,
         device_map="auto",
-        trust_remote_code=True
     )
+
+    print(f"Applying LoRA adapter from: {LORA_PATH}...")
+    model = PeftModel.from_pretrained(base_model, LORA_PATH)
+
     return tokenizer, model
 
-def run_mcq(model, tokenizer):
-    print("\n--- Running MCQ Task (Logits Strategy) ---")
+
+def run_mcq(model, tokenizer, retriever):
+    """Run Multiple Choice Question task with RAG."""
+    print("\n--- Running MCQ Task (RAG + Logits Strategy) ---")
     df_test = pd.read_csv(FILES["test_mcq"])
 
-    # 预计算 A, B, C, D 的 token ID
+    # Pre-compute token IDs for A, B, C, D
     choices = ["A", "B", "C", "D"]
     choice_ids = [tokenizer.encode(c, add_special_tokens=False)[-1] for c in choices]
 
     results = []
 
     for _, row in tqdm(df_test.iterrows(), total=len(df_test)):
-        # 构造 Prompt: 只要问题和选项
-        prompt = f"[INST] Read the question. Choose the correct option (A, B, C, or D).\n\n{row['prompt']} [/INST] The answer is"
+        # 1. Retrieve background knowledge
+        context = retriever.search(row['prompt'], top_k=3)
+
+        # 2. Construct the RAG Prompt
+        instruction = "You are a cross-cultural expert. Use the provided context to help you answer. Read the question carefully and output ONLY the letter of the correct option (A, B, C, or D)."
+        prompt = f"<s>[INST] {instruction}\n\nContext:\n{context}\n\nQuestion:\n{row['prompt']} [/INST]"
 
         inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
 
+        # 3. Predict using logits
         with torch.no_grad():
             outputs = model(**inputs)
-            # 获取最后一个 token 的预测概率分布
             logits = outputs.logits[0, -1, :]
-
-            # 只比较 A, B, C, D 四个 token 的分数
             scores = [logits[i].item() for i in choice_ids]
-            best_idx = scores.index(max(scores)) # 找到分数最高的索引
+            best_idx = scores.index(max(scores))
             best_choice = choices[best_idx]
 
-        # 格式化输出 (True/False)
         entry = {
             "MCQID": row['MCQID'],
             "A": False, "B": False, "C": False, "D": False
@@ -72,68 +89,77 @@ def run_mcq(model, tokenizer):
         entry[best_choice] = True
         results.append(entry)
 
-    # 保存结果
+    # Save results
     out_df = pd.DataFrame(results)
-    out_df = out_df[["MCQID", "A", "B", "C", "D"]] # 确保列顺序
+    out_df = out_df[["MCQID", "A", "B", "C", "D"]]
     out_df.to_csv("mcq_prediction.tsv", sep='\t', index=False)
     print("✅ MCQ predictions saved to mcq_prediction.tsv")
 
-def run_saq(model, tokenizer):
-    print("\n--- Running SAQ Task (Few-Shot Strategy) ---")
-    df_train = pd.read_csv(FILES["train_saq"])
+
+
+
+def run_saq(model, tokenizer, retriever):
+    """Run Short Answer Question task with RAG and aggressive post-processing."""
+    print("\n--- Running SAQ Task (RAG + Zero-Shot Strategy) ---")
     df_test = pd.read_csv(FILES["test_saq"])
-
-    # 1. 准备 Few-Shot 样本 (从训练集提取正确答案)
-    def get_clean_ans(s):
-        try:
-            d = ast.literal_eval(s)
-            return d[0]['en_answers'][0] if d and 'en_answers' in d[0] else "unknown"
-        except: return "unknown"
-
-    df_train['clean_ans'] = df_train['annotations'].apply(get_clean_ans)
-
-    # 随机取 3 个例子作为示范
-    examples = df_train.sample(3)
-    few_shot_prompt = ""
-    for _, row in examples.iterrows():
-        few_shot_prompt += f"Question: {row['en_question']}\nAnswer: {row['clean_ans']}\n\n"
 
     results = []
 
     for _, row in tqdm(df_test.iterrows(), total=len(df_test)):
         question = row['en_question']
 
-        # 2. 构造 Prompt: 强指令 + 例子 + 当前问题
-        instruction = "Answer the question with a single entity, phrase, or number. Do not use full sentences."
-        final_prompt = f"[INST] {instruction}\n\n{few_shot_prompt}Question: {question}\nAnswer: [/INST]"
+        # 1. Retrieve background knowledge
+        context = retriever.search(question, top_k=3)
+
+        # 2. Construct the RAG Prompt
+        instruction = "You are a cross-cultural expert. Use the provided context to help you answer. Answer the question with a single entity, phrase, or short words. Do not use full sentences."
+        final_prompt = f"<s>[INST] {instruction}\n\nContext:\n{context}\n\nQuestion:\n{question} [/INST]"
 
         inputs = tokenizer(final_prompt, return_tensors="pt").to("cuda")
 
-        # 3. 生成 (限制长度，防止废话)
+        # 3. Generate short answer
         with torch.no_grad():
             outputs = model.generate(
                 **inputs,
-                max_new_tokens=15, # 关键：限制只能输出短语
+                max_new_tokens=15,
                 pad_token_id=tokenizer.eos_token_id,
-                do_sample=False # 贪婪搜索，最稳定
+                do_sample=False
             )
 
-        ans = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        # 提取 [/INST] 之后的内容
-        ans = ans.split("[/INST]")[-1].strip().split("\n")[0]
+        # 4. Decode and AGGRESSIVELY clean the output
+        full_ans = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        results.append({"ID": row['ID'], "answer": ans})
+        # Extract everything after [/INST]
+        raw_ans = full_ans.split("[/INST]")[-1].strip()
 
-    # 保存结果
+        # Use Regex to chop off hallucinations, lists, and explanations
+        # This splits the string at the first occurrence of [, (, |, /, #, or newline
+        clean_ans = re.split(r'\[|\(|\||/|#|\n', raw_ans)[0].strip()
+
+        # Remove any trailing weird punctuation that might be left
+        clean_ans = clean_ans.rstrip(":-;,")
+
+        results.append({"ID": row['ID'], "answer": clean_ans})
+
+    # Save results
     out_df = pd.DataFrame(results)
-    out_df.to_csv("saq_prediction.tsv", sep='\t', index=False)
-    print("✅ SAQ predictions saved to saq_prediction.tsv")
+    out_df.to_csv("saq_prediction_cleaned.tsv", sep='\t', index=False)
+    print("✅ Cleaned SAQ predictions saved to saq_prediction_cleaned.tsv")
+
 
 if __name__ == "__main__":
     if not torch.cuda.is_available():
         print("❌ Error: GPU not found. This script requires a GPU.")
     else:
+        # Initialize the RAG Retriever
+        print("Initializing RAG Retriever...")
+        retriever = CulturalRetriever()
+
+        # Initialize the Fine-tuned Model
         tokenizer, model = setup_model()
-        run_mcq(model, tokenizer)
-        run_saq(model, tokenizer)
-        print("\n🎉 All tasks completed! Zip the .tsv files and submit.")
+
+        # Run both tasks
+        run_mcq(model, tokenizer, retriever)
+        run_saq(model, tokenizer, retriever)
+
+        print("\n🎉 All tasks completed! You can now submit the .tsv files to Codabench.")

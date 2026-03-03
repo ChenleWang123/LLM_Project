@@ -1,5 +1,18 @@
+# Python cache
 __pycache__/
-*.pyc
-.idea/
+*.py[cod]
+
+# Virtual environments
 venv/
+env/
+.env
+
+# Data and Models (DO NOT push these to GitHub)
 model/
+vector_store/
+
+# IDE files
+.vscode/
+
+# Results
+*.tsv

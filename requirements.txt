@@ -1,0 +1,11 @@
+torch
+transformers
+peft
+trl
+bitsandbytes
+datasets
+faiss-gpu
+sentence-transformers
+pandas
+wikipedia
+tqdm
